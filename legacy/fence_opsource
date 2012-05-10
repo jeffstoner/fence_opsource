@@ -1,0 +1,260 @@
+#!/usr/bin/perl
+
+# fence_opsource - fencing agent for OpSource Cloud
+#
+# Written by Jeff Stoner <jstoner@opsource.net>
+# Copyright 2012 Jeff Stoner
+#
+# Disclaimer: This program is provided AS-IS with
+# NO WARRANTIES EXPRESSED OR IMPLIED. Use it at
+# your own risk.
+
+use strict;  # because it's the only way to write Perl
+use URI;  # for parsing URLs
+use LWP;  # for HTTP operations
+use XML::Simple;  # for parsing messages from the OpSource API
+use Getopt::Long;  # for parsing command-line
+use MIME::Base64;  # for authentication
+
+# These modules are not directly used by this script, however we
+# include use statements here to force the user to have them
+# installed. Installing from RPM should handle this, though.
+use XML::NamespaceSupport;
+
+# constants
+my $VERSION = '0.09';
+
+# variables
+my $action = undef;  # the action to perform
+my $username = '';  # username for connection to OpSource Cloud
+my $password = '';  # password for connecting to OpSource Cloud
+my $apiHost = undef;  # the API hostname
+#my $passwd_script = '';  # script to run to get the password
+my $orgID = '';  # the orgID from OpSource Cloud
+my $serverID = '';  # the serverID from OpSource Cloud
+my $authtoken = '';  # authentication token
+my $ignored = '';  # it's ignored, whatever it is
+my $help = '';  # to show help() or not
+my $interactive = 0;  # only set when command line args are used
+my $ret = 1;  # return code
+
+# defaults
+my $DEFAULT_ACTION = 'off';
+my $DEFAULT_API_HOST = 'api.opsourcecloud.net';
+
+# if no ARGV, parse STDIN
+parseInput() unless (parseCommandLine());
+
+# make sure we have values to work with
+die "invalid username" unless (defined $username && $username ne '');
+die "invalid serverid" unless (defined $serverID && $serverID ne '');
+die "invalid orgid" unless (defined $orgID && $orgID ne '');
+die "invalid password" unless (defined $password && $password ne '');
+
+# fall back to defaults if necessary
+$action = $DEFAULT_ACTION unless (defined $action && $action ne '');
+$apiHost = $DEFAULT_API_HOST unless (defined $apiHost && $apiHost ne '');
+
+my $API = URI->new('https://' . $apiHost . '/oec/0.9/');
+
+# create our browser object
+my $browser = LWP::UserAgent->new();
+
+# set browser properties
+$browser->timeout(10);  # 10 second timeout on all requests
+$browser->agent("OpSource Fencing Agent/$VERSION");
+
+# OpSource Cloud uses Basic HTTP Authentication
+$authtoken = "Basic " . encode_base64("$username:$password");
+$browser->default_header('authorization' => $authtoken);
+
+# at this point, we have everything we need
+# figure out what to do using $action
+for ($action) {
+   /start/      and do { $ret = startServer($browser, $orgID, $serverID); last; };
+   /on/		and do { $ret = startServer($browser, $orgID, $serverID); last; };
+   /stop/       and do { $ret = stopServer($browser, $orgID, $serverID); last; };
+   /off/	and do { $ret = stopServer($browser, $orgID, $serverID); last; };
+   /status/     and do { $ret = serverStatus($browser, $orgID, $serverID, $interactive); last; };
+   /reboot/	and do { $ret = rebootServer($browser, $orgID, $serverID); last; };
+   /list/       and do { print "Not implemented\n"; $ret = 0; last; };
+   die "invalid action: $action";
+}
+
+exit $ret;
+
+sub stopServer($$$) {
+   # shut down a OpSource Cloud server
+   my ($br, $org, $srv) = @_;  # grab args
+
+   # issue API call to stop the server
+   my $resp = $br->get($API . $org . '/server/' . $srv . '?poweroff');
+
+   # need to check the XML. If the server was already stopped, return true.
+   if ($resp->is_success) {
+      return 0;
+   } else {
+      # check XML for REASON_40 message
+      my $xml = XMLin($resp->content(), NSExpand => 1);
+      if ($xml->{'{http://oec.api.opsource.net/schemas/general}resultCode'} eq 'REASON_40') {
+         # already stopped
+         return 0;
+      } else {
+         # assume anything else is failure
+         return 1
+      }
+   }
+}
+
+sub startServer($$$) {
+   # start up a OpSource Cloud server
+   my ($br, $org, $srv) = @_;  # grab args
+
+   # issue API call to start the server
+   my $resp = $br->get($API . $org . '/server/' . $srv . '?start');
+
+   # need to check the XML. If the server was already started, return true.
+   if ($resp->is_success) {
+      return 0;
+   } else {
+      # check XML for REASON_40 message
+      my $xml = XMLin($resp->content(), NSExpand => 1);
+      if ($xml->{'{http://oec.api.opsource.net/schemas/general}resultCode'} eq 'REASON_40') {
+         # already started
+         return 0;
+      } else {
+         # assume anything else is failure
+         return 1
+      }
+   }
+}
+
+sub serverStatus($$$$) {
+   # gets the server's power status
+   my ($br, $org, $srv, $external) = @_;  # grab args
+   # $external controls whether we print info to STDOUT or not
+
+   # issue the API call to list the server info
+   my $resp = $br->get($API . $org . '/server/' . $srv);
+
+   # check HTTP request
+   if ($resp->is_success) {
+      # parse the XML response
+      my $xml = XMLin(
+        $resp->content(),
+        ForceArray => ['Server'],
+        KeyAttr => { 'Server' => 'id', });
+
+      if (defined $xml->{'isStarted'}) {
+         print "Server $srv power status is: ", $xml->{'isStarted'}, "\n" if ($external);
+
+         # reverse return code so caller can pass it to the shell
+         $xml->{'isStarted'} eq "true" ? return 0 : return 1;
+      } else {
+         # failure to parse XML is considered a failure
+         print "Unable to determine server $srv status (XML parse error)\n" if ($external);
+         return 1;
+      }
+   } else {
+      # the API call failed
+      print "Unable to determine server $srv status (invalid args)\n" if ($external);
+      return 1;
+   }
+}
+
+sub rebootServer($$$) {
+   # reboot an OpSource Cloud server
+   my ($br, $org, $srv) = @_;  # grab args
+
+   if (stopServer($br, $org, $srv)) {
+      # serverStop returns Perl true on failure, 'cuz that's how we roll
+      # failure to stop
+      return 1;
+   }
+   # let's give the cloud a few seconds to finish the stop
+   sleep 60;
+
+   # start it up
+   return startServer($br, $org, $srv);
+}
+
+sub parseCommandLine() {
+   # args are coming from the command line
+   # for reference, see http://sources.redhat.com/cluster/wiki/FenceAgentAPI
+
+   GetOptions(
+	'action=s' => \$action,
+	'option=s' => \$action,
+	'login=s' => \$username,
+	'username=s' => \$username,
+	'passwd=s' => \$password,
+	'password=s' => \$password,
+	#"passwd_script=s" => \$passwd_script,
+	'port:s' => \$ignored,
+	'ipaddr=s' => \$serverID,
+	'serverid=s' => \$serverID,
+	'orgid=s' => \$orgID,
+	'apihost=s' => \$apiHost,
+	'help' => sub { $help=1, die("!FINISH"); },
+   );
+
+   if ($help) {
+      fenceHelp();
+      exit 0;
+   }
+   if ($action || $username || $password || $serverID || $orgID || $apiHost) {
+      $interactive = 1;
+      return 1;
+   } else {
+      return undef;
+   }
+   # we need either $password or $passwd_script, preferring the former
+   #if ($password eq '' and $passwd_script ne '') {
+   #   # run the script to get the password
+   #   $password=`$passwd_script`;  # TOTALLY UNSAFE!!!
+   #   chomp($password);
+   #   if ($password eq '') {
+   #      die "passwd_script produced no password";
+   #   }
+   #}
+}
+
+sub parseInput() {
+   # args come in on STDIN
+   # for reference, see http://sources.redhat.com/cluster/wiki/FenceAgentAPI
+
+   while(<STDIN>) {
+      chomp;
+      /^action=/ && do { (undef, $action) = split(/=/); next; };
+      /^option=/ && do { (undef, $action) = split(/=/); next; };
+      /^login=/ && do { (undef, $username) = split(/=/); next; };
+      /^username=/ && do { (undef, $username) = split(/=/); next; };
+      /^passwd=/ && do { (undef, $password) = split(/=/); next; };
+      /^password=/ && do { (undef, $password) = split(/=/); next; };
+      #/^passwd_script=/ && do { (undef, $passwd_script) = split(/=/); next; };
+      /^ipaddr=/ && do { (undef, $serverID) = split(/=/); next; };
+      /^serverid=/ && do { (undef, $serverID) = split(/=/); next; };
+      /^orgid=/ && do { (undef, $orgID) = split(/=/); next; };
+      /^apihost=/ && do { (undef, $apiHost) = split(/=/); next; };
+   }
+
+   #if ($password eq '' and $passwd_script ne '') {
+   #   $password = `$passwd_script`;
+   #   chomp($password);
+   #   if ($password eq '') {
+   #     die "passwd_script produced no password";
+   #   }
+   #}
+}
+
+sub fenceHelp() {
+   # print some helpful info
+   print STDOUT "fence_opsource v$VERSION - fencing agent for Cluster services\n";
+   print STDOUT "--action=[on|off|status|reboot]\n";
+   print STDOUT "--username=<username>\n";
+   print STDOUT "--password=<password>\n";
+   print STDOUT "--orgid=<organization id>\n";
+   print STDOUT "--serverid=<server id>\n";
+   print STDOUT "--apihost=<api hostname>\n";
+   print STDOUT "--help (this message)\n";
+}

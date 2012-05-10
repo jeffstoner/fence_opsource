@@ -1,0 +1,192 @@
+#!/usr/bin/perl
+
+# fence_opsource_info
+#
+# This helper program to the fence_opsource fencing agent allows
+# the user to find their Organization ID and the IDs for the
+# servers that will participate in their cluster. It can also help
+# validate the username/password that may be used for fencing.
+#
+# Written by Jeff Stoner <jstoner@opsource.net>
+# Copyright 2012 Jeff Stoner
+#
+# Disclaimer: This program is provided AS-IS with
+# NO WARRANTIES EXPRESSED OR IMPLIED. Use it at
+# your own risk.
+
+use strict;
+use URI;
+use LWP;  # be sure one of the SSL provider modules is installed, too
+use XML::Simple;
+use Term::ReadKey;
+use MIME::Base64;
+
+# we don't explicitly use these modules but depend on their functionality
+use XML::NamespaceSupport;
+
+# check for SSL support - ugly hack until LWP::Protocol::https is adopted
+eval { require Crypt::SSLeay };
+if ($@) {
+   eval { require IO::Socket::SSL };
+   if ($@) { die "Your LWP module has no https support."; }
+}
+
+# constants
+my $DEFAULT_API_HOST = 'api.opsourcecloud.net';
+my $DEFAULT_API_PATH = '/oec/0.9/';
+
+# variables
+my $apihost = '';
+my $username = '';
+my $password = '';
+my $authtoken = '';
+my $orgID = '';
+my $response = '';
+my $xml = '';
+my %servers = ();
+my $server = '';
+my %networks = {};
+my $networkId = '';
+my $exitcode = 0;
+
+print 'Enter your API hostname [default: ' . $DEFAULT_API_HOST . ']: ';
+$apihost = ReadLine 0;
+chomp $apihost;
+
+if ($apihost eq '') { $apihost = $DEFAULT_API_HOST; }
+
+my $API = URI->new('https://' . $apihost . $DEFAULT_API_PATH);
+
+# create our browser object
+my $browser = LWP::UserAgent->new();
+
+# get the username and password to authenticate with
+print "Enter your username: ";
+$username = ReadLine 0;
+chomp $username;  # strip trailing newline
+
+print "Enter the password for $username: ";
+ReadMode 'noecho';  # no shoulder surfing
+$password = ReadLine 0;
+chomp $password;  # strip trailing newline
+ReadMode 'normal';
+print "\n";
+
+if ($username eq "" || $password eq "") {
+   print "You must supply a username and password.\n";
+   exit 1;
+}
+
+# set browser properties
+$browser->timeout(10);  # 10 second timeout on all requests
+$browser->agent("CloudInfo/0.01");
+
+# OpSource Cloud uses Basic HTTP Authentication
+$authtoken = "Basic " . encode_base64("$username:$password");
+$browser->default_header('authorization' => $authtoken);
+
+# we need the orgID associated with this account
+if ($orgID = getOrgID($browser)) {
+   print "Cloud Summary\n";
+   print "Organization ID: $orgID\n";
+
+   # we get a list of networks first. You cannot deploy servers
+   # without networks.
+   if (%networks = getNetworks($browser, $orgID)) {
+      if (%servers = getServers($browser, $orgID)) {
+         # print out all the servers we found, including some net info
+         print "Servers:\n";
+         foreach $server (keys %servers) {
+            $networkId = $servers{$server}{'network'};
+            print "ID: $server";
+            print "\n\tName: " . $servers{$server}{'name'};
+            print "\n\tPrivate IP: " . $servers{$server}{'privateIp'};
+            print "\n\tNetwork: " . $networks{$networkId}{'name'};
+            print "\n\tLocation: " . $networks{$networkId}{'location'};
+            print "\n";
+         }
+      } else {
+         # no servers found
+         print "Unable to find any servers.\n";
+         $exitcode=1;
+      }
+   } else {
+      # No networks means no servers
+      print "Unable to find any networks.\n";
+      $exitcode=1;
+   }
+} else {
+   print "Unable to authenticate.\n";
+   $exitcode=1;
+}
+exit $exitcode;
+
+sub getOrgID($) {
+   my $br = shift;  # get our browser object
+   my $resp = $br->get($API . "myaccount");  # make the API call
+   if ($resp->is_success) {
+      # parse the XML response
+      my $xml = XMLin($resp->content(), NSExpand => 1);
+      die "Unable to determine OrgID" if (! defined $xml->{'{http://oec.api.opsource.net/schemas/directory}orgId'});
+      return $xml->{'{http://oec.api.opsource.net/schemas/directory}orgId'};
+   } else {
+      return undef;
+   }
+}
+
+sub getServers($$) {
+   my ($br, $org) = @_;  # grab our browser object and orgId
+   my $resp = $br->get($API . $org . "/server/deployed");  # make the API call
+   my %srvrs = ();  # for holding our return values
+
+   if ($resp->is_success) {
+      # parse the XML response
+      my $xml = XMLin($resp->content(),
+         ForceArray => ['DeployedServer'],
+         KeyAttr => { 'DeployedServer' => 'id', },);
+
+      # iterate over the servers, storing results in a hash
+      foreach my $srv (keys %{ $xml->{'DeployedServer'} }) {
+         $srvrs{$srv} = {
+            'name' => $xml->{'DeployedServer'}->{$srv}->{'name'},
+            'privateIp' => $xml->{'DeployedServer'}->{$srv}->{'privateIpAddress'},
+            'network' => $xml->{'DeployedServer'}->{$srv}->{'networkId'},
+         };
+      }
+   } else {
+      # the call failed so just bail
+      return undef;
+   }
+   return %srvrs;
+}
+
+sub getNetworks($$) {
+   my ($br, $org) = @_;  # grab our browser object and orgId
+   my $resp = $br->get($API . $org . "/networkWithLocation");  # make the API call
+   my %nets = ();  # for holding our return values
+   my ($netId, $netName, $netLocation) = '';  # for convenience
+
+   if ($resp->is_success) {
+      # parse the XML response
+      my $xml = XMLin(
+         $resp->content(),
+         ForceArray => ['{http://oec.api.opsource.net/schemas/network}network'],
+         KeyAttr => { '{http://oec.api.opsource.net/schemas/network}network' => '+{http://oec.api.opsource.net/schemas/network}id' },
+         NSExpand => 1);
+
+      foreach my $net (keys %{ $xml->{'{http://oec.api.opsource.net/schemas/network}network'} }) {
+         $netId = $xml->{'{http://oec.api.opsource.net/schemas/network}network'}->{"$net"}->{'{http://oec.api.opsource.net/schemas/network}id'};
+         $netName = $xml->{'{http://oec.api.opsource.net/schemas/network}network'}->{"$net"}->{'{http://oec.api.opsource.net/schemas/network}name'};
+         $netLocation = $xml->{'{http://oec.api.opsource.net/schemas/network}network'}->{"$net"}->{'{http://oec.api.opsource.net/schemas/network}location'};
+
+         # populate our hash
+         $nets{$netId} = { 'name' => $netName, 'location' => $netLocation };
+      }
+   } else {
+      # the call failed so just bail
+      return undef;
+   }
+   return %nets;
+}
+
+1;
